@@ -25,6 +25,8 @@ cd vita && ./fetch.sh && ./build_tc.sh && ./build_deps.sh && ./build_libs.sh && 
 The output is `vita/b/game/MetroidPrime.vpk`.
 
 ## Installing
+A ready-built VPK (build 49) and the data files are in [`download/`](download/) — see [download/README.md](download/README.md). To install a build you made yourself:
+
 1. Install `MetroidPrime.vpk` with VitaShell.
 2. Put your ISO in `ux0:data/MetroidPrime/rom/`.
 3. Launch. Logs go to `ux0:data/MetroidPrime/error.log`.
