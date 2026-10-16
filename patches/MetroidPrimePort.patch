@@ -1,0 +1,1844 @@
+diff --git a/extern/aurora/include/aurora/gfx.hpp b/extern/aurora/include/aurora/gfx.hpp
+index aacbfb6..943a82a 100644
+--- a/extern/aurora/include/aurora/gfx.hpp
++++ b/extern/aurora/include/aurora/gfx.hpp
+@@ -8,7 +8,11 @@
+ 
+ namespace aurora::gfx {
+ 
++#ifdef __vita__
++inline constexpr size_t InlineDrawPayloadSize = 192; // DrawImmediateData carries the array hashes on the Vita
++#else
+ inline constexpr size_t InlineDrawPayloadSize = 128;
++#endif
+ inline constexpr size_t MaxColorAttachments = 8;
+ inline constexpr uint32_t SceneColorAttachmentIndex = 0;
+ 
+diff --git a/extern/aurora/lib/aurora.cpp b/extern/aurora/lib/aurora.cpp
+index eea6fab..8ed746a 100644
+--- a/extern/aurora/lib/aurora.cpp
++++ b/extern/aurora/lib/aurora.cpp
+@@ -300,10 +300,14 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+     std::exit(1);
+   }
+ 
+-  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
++  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend.
++  // Vita headless build: no SDL renderer (it would take over the display that
++  // shows the port's status text); ImGui simply isn't drawn.
++#ifndef __vita__
+   if (webgpu::g_backendType == wgpu::BackendType::Null) {
+     AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+   }
++#endif
+ #else
+   AuroraBackend selectedBackend = BACKEND_NULL;
+   AURORA_ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
+diff --git a/extern/aurora/lib/dawn/BackendBinding.cpp b/extern/aurora/lib/dawn/BackendBinding.cpp
+index 447ead8..83adf89 100644
+--- a/extern/aurora/lib/dawn/BackendBinding.cpp
++++ b/extern/aurora/lib/dawn/BackendBinding.cpp
+@@ -18,7 +18,12 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
+   return SetupWindowAndGetSurfaceDescriptorCocoa(window);
+ #else
+   const auto props = SDL_GetWindowProperties(window);
+-#if defined(SDL_PLATFORM_ANDROID)
++#if defined(__vita__)
++  // The Vita build's WebGPU layer draws to the Vita display itself; it needs no
++  // native window handle, only a non-empty descriptor chain.
++  (void)props;
++  return std::make_shared<wgpu::ChainedStruct>();
++#elif defined(SDL_PLATFORM_ANDROID)
+   std::shared_ptr<wgpu::SurfaceSourceAndroidNativeWindow> desc =
+       std::make_shared<wgpu::SurfaceSourceAndroidNativeWindow>();
+   desc->window = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+diff --git a/extern/aurora/lib/dolphin/pad/pad.cpp b/extern/aurora/lib/dolphin/pad/pad.cpp
+index 1752efb..8da62db 100644
+--- a/extern/aurora/lib/dolphin/pad/pad.cpp
++++ b/extern/aurora/lib/dolphin/pad/pad.cpp
+@@ -33,6 +33,26 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsStandard{{
+     {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_BUTTON_RIGHT},
+ }};
+ 
++#ifdef __vita__
++// The Vita has L and R but no analog triggers: L is the GameCube's L (lock-on),
++// Select is Z (the map). R fires: it is the A button's second input
++// (PortDebug::PadAltButton); the right stick aims, so free look (GC R) needs no button.
++std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsVita{{
++    {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
++    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_B},
++    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_X},
++    {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_Y},
++    {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
++    {SDL_GAMEPAD_BUTTON_BACK, PAD_TRIGGER_Z},
++    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, PAD_TRIGGER_L},
++    {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_R},
++    {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_BUTTON_UP},
++    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_BUTTON_DOWN},
++    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_BUTTON_LEFT},
++    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_BUTTON_RIGHT},
++}};
++#endif
++
+ std::array<PADStatus, PAD_CHANMAX> g_virtualPadStatus{};
+ std::array<bool, PAD_CHANMAX> g_virtualPadActive{};
+ 
+@@ -509,7 +529,11 @@ void __PADSetDefaultMapping(aurora::input::GameController* controller) /*  NOLIN
+     controller->m_buttonMapping = g_defaultButtonsXBoxOne;
+     break;
+   case SDL_GAMEPAD_TYPE_STANDARD:
++#ifdef __vita__
++    controller->m_buttonMapping = g_defaultButtonsVita;
++#else
+     controller->m_buttonMapping = g_defaultButtonsStandard;
++#endif
+     break;
+   case SDL_GAMEPAD_TYPE_PS3:
+     controller->m_buttonMapping = g_defaultButtonsPS3;
+diff --git a/extern/aurora/lib/dolphin/thp/THPDec.cpp b/extern/aurora/lib/dolphin/thp/THPDec.cpp
+index 3eb88ac..7547fe8 100644
+--- a/extern/aurora/lib/dolphin/thp/THPDec.cpp
++++ b/extern/aurora/lib/dolphin/thp/THPDec.cpp
+@@ -1,10 +1,14 @@
+ #include "dolphin/thp.h"
++#include "mp_vita_prof.h"
+ 
+ #include "../../internal.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#if defined(__vita__) && defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ 
+ namespace {
+ // Error codes
+@@ -425,6 +429,10 @@ bool decode_block(BitReader& reader, DecodeContext& context, size_t componentInd
+ inline float fmaf_exact(float a, float b, float c) noexcept {
+ #ifdef __FMA__
+   return std::fma(a, b, c);
++#elif defined(__vita__)
++  // Vita (Cortex-A9, no FMA): the double-precision emulation below cost ~20 ms
++  // a frame. A plain float multiply-add differs at most in the last bit.
++  return a * b + c;
+ #else
+   return static_cast<float>(static_cast<double>(a) * static_cast<double>(b) + static_cast<double>(c));
+ #endif
+@@ -433,6 +441,29 @@ inline float fmaf_exact(float a, float b, float c) noexcept {
+ struct Lanes {
+   std::array<float, 8> v;
+ };
++#if defined(__vita__) && defined(__ARM_NEON)
++// NEON versions of the eight-column operations (GCC won't vectorise float
++// loops for NEON without -ffast-math).
++inline float32x4_t lo(const Lanes& a) noexcept { return vld1q_f32(a.v.data()); }
++inline float32x4_t hi(const Lanes& a) noexcept { return vld1q_f32(a.v.data() + 4); }
++inline Lanes mk(float32x4_t l, float32x4_t h) noexcept {
++  Lanes r;
++  vst1q_f32(r.v.data(), l);
++  vst1q_f32(r.v.data() + 4, h);
++  return r;
++}
++inline Lanes operator+(const Lanes& a, const Lanes& b) noexcept { return mk(vaddq_f32(lo(a), lo(b)), vaddq_f32(hi(a), hi(b))); }
++inline Lanes operator-(const Lanes& a, const Lanes& b) noexcept { return mk(vsubq_f32(lo(a), lo(b)), vsubq_f32(hi(a), hi(b))); }
++inline Lanes operator+(const Lanes& a, float b) noexcept {
++  const float32x4_t k = vdupq_n_f32(b);
++  return mk(vaddq_f32(lo(a), k), vaddq_f32(hi(a), k));
++}
++inline Lanes operator*(const Lanes& a, float b) noexcept { return mk(vmulq_n_f32(lo(a), b), vmulq_n_f32(hi(a), b)); }
++inline Lanes operator-(const Lanes& a) noexcept { return mk(vnegq_f32(lo(a)), vnegq_f32(hi(a))); }
++inline Lanes fmaf_exact(const Lanes& a, float b, const Lanes& c) noexcept {
++  return mk(vmlaq_n_f32(lo(c), lo(a), b), vmlaq_n_f32(hi(c), hi(a), b));
++}
++#else
+ inline Lanes operator+(const Lanes& a, const Lanes& b) noexcept {
+   Lanes r;
+   for (size_t i = 0; i < 8; ++i) {
+@@ -475,6 +506,7 @@ inline Lanes fmaf_exact(const Lanes& a, float b, const Lanes& c) noexcept {
+   }
+   return r;
+ }
++#endif
+ 
+ template <class T> struct EvenHalfT {
+   T out0, out1, out2, out3;
+@@ -595,12 +627,22 @@ std::array<u8, 64> inverse_dct(const std::array<s16, 64>& coefficients,
+   }
+   const std::array<Lanes, 8> transformed = transform_column(input);
+   std::array<u8, 64> output{};
++#if defined(__vita__) && defined(__ARM_NEON)
++  // Same rounding as below: truncate toward zero, then clamp to 0..255.
++  for (size_t row = 0; row < 8; ++row) {
++    const int32x4_t l = vcvtq_s32_f32(vmulq_n_f32(vld1q_f32(transformed[row].v.data()), 0.125f));
++    const int32x4_t h = vcvtq_s32_f32(vmulq_n_f32(vld1q_f32(transformed[row].v.data() + 4), 0.125f));
++    const uint16x8_t w = vcombine_u16(vqmovun_s32(l), vqmovun_s32(h));
++    vst1_u8(&output[row * 8], vqmovn_u16(w));
++  }
++#else
+   for (size_t row = 0; row < 8; ++row) {
+     for (size_t column = 0; column < 8; ++column) {
+       const float scaled = transformed[row].v[column] * 0.125f;
+       output[row * 8 + column] = scaled <= 0.0f ? 0 : scaled >= 255.0f ? 255 : static_cast<u8>(scaled);
+     }
+   }
++#endif
+   return output;
+ }
+ 
+@@ -636,7 +678,14 @@ bool decode_and_write_block(BitReader& reader, DecodeContext& context, size_t co
+ extern "C" {
+ BOOL THPInit(void) { return TRUE; }
+ 
++static s32 THPVideoDecodeImpl(const void* file, void* tileY, void* tileU, void* tileV);
+ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void*) {
++  MP_PROF_BEGIN(MP_PROF_THP_VIDEO);
++  const s32 r = THPVideoDecodeImpl(file, tileY, tileU, tileV);
++  MP_PROF_END(MP_PROF_THP_VIDEO);
++  return r;
++}
++static s32 THPVideoDecodeImpl(const void* file, void* tileY, void* tileU, void* tileV) {
+   if (file == nullptr) {
+     return kNoInput;
+   }
+diff --git a/extern/aurora/lib/gfx/resources.hpp b/extern/aurora/lib/gfx/resources.hpp
+index 59b8141..7418470 100644
+--- a/extern/aurora/lib/gfx/resources.hpp
++++ b/extern/aurora/lib/gfx/resources.hpp
+@@ -4,11 +4,22 @@
+ 
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = true;
++#if defined(__vita__)
++// PS Vita: ~360 MB of RAM in total, and five staging buffers hold one of each, so the
++// per-frame budgets are sized for a GameCube frame rather than a PC's. A frame that
++// overflows one drops the extra data (see overflowed() in recording.cpp).
++inline constexpr uint64_t UniformBufferSize = 6291456;  // 6 MiB
++inline constexpr uint64_t VertexBufferSize = 2097152;   // 2 MiB
++inline constexpr uint64_t IndexBufferSize = 1048576;    // 1 MiB
++inline constexpr uint64_t StorageBufferSize = 3145728;  // 3 MiB
++inline constexpr uint64_t TextureUploadSize = 4194304;  // 4 MiB
++#else
+ inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
+ inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
+ inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
+ inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB
+ inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB
++#endif
+ 
+ // What a frame can hold of each kind of data. The constants above are the sizes at
+ // AuroraConfig::frameBufferScale 1; initialize() fixes the sizes in use for the run.
+diff --git a/extern/aurora/lib/gx/command_processor.cpp b/extern/aurora/lib/gx/command_processor.cpp
+index 0520d58..29766d1 100644
+--- a/extern/aurora/lib/gx/command_processor.cpp
++++ b/extern/aurora/lib/gx/command_processor.cpp
+@@ -460,13 +460,31 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+       continue;
+     }
+     auto& array = state.arrays[i];
++#ifdef __vita__
++    const bool fresh = array.cachedRange.size == 0;
++    bool isResident = false;
++    if (fresh) isResident = resident::array_range(array.data, array.size, array.cachedRange);
++    if (array.cachedRange.size == 0) {
++#else
+     if (array.cachedRange.size == 0 && !resident::array_range(array.data, array.size, array.cachedRange)) {
++#endif
+       array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+       if (drop_overflowed_draw(array.cachedRange, "storage")) {
+         array.cachedRange = {};
+         return;
+       }
+     }
++#ifdef __vita__
++    if (fresh) {
++      // A resident array is named by where it lives (its bytes cannot change while the
++      // generation stands); a pushed one by its bytes.
++      array.cachedHash = isResident ? (array.cachedRange.offset * 0x9E3779B1u) ^ (resident::generation() * 0xC2B2AE35u) ^
++                                          0x52455331u
++                                    : static_cast<u32>(XXH3_64bits(array.data, array.size));
++      array.cachedHash ^= array.size * 0x27D4EB2Fu;
++    }
++    immediates.arrayHash[i - GX_VA_POS] = array.cachedHash ^ (array.baseIndex * 0x85EBCA77u) ^ array.stride;
++#endif
+     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset + array.baseIndex * array.stride;
+   }
+ 
+diff --git a/extern/aurora/lib/gx/gx.cpp b/extern/aurora/lib/gx/gx.cpp
+index 53f7ae4..9e8000f 100644
+--- a/extern/aurora/lib/gx/gx.cpp
++++ b/extern/aurora/lib/gx/gx.cpp
+@@ -32,6 +32,10 @@
+ 
+ static aurora::Module Log("aurora::gx");
+ 
++#ifdef __vita__
++void wv_gx_note_pipeline_config(const aurora::gx::PipelineConfig& config);
++#endif
++
+ namespace aurora::gx {
+ using webgpu::g_device;
+ using webgpu::g_graphicsConfig;
+@@ -347,6 +351,10 @@ const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.t
+ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+                                     wgpu::ShaderModule shader, const char* label) noexcept {
+   ZoneScoped;
++#ifdef __vita__
++  // webgpu_vita (the Vita renderer) builds GX pipelines from the config, not the WGSL.
++  wv_gx_note_pipeline_config(config);
++#endif
+   if (config.shadowPass != 0) {
+     // The sun's shadow map: depth only, culled as the draw is, with Remastered's shadow pass bias
+     // (2 units, slope 4, no clamp).
+diff --git a/extern/aurora/lib/gx/gx.hpp b/extern/aurora/lib/gx/gx.hpp
+index a05b384..b0c86ec 100644
+--- a/extern/aurora/lib/gx/gx.hpp
++++ b/extern/aurora/lib/gx/gx.hpp
+@@ -96,9 +96,18 @@ struct DrawImmediateData {
+   u32 fogRangeBase = 0;
+   u32 serial = 0; // the draw's serial, read by shaders built with ShaderConfig::drawId; in the shadow pass, the cascade
+   std::array<u32, MaxIndexAttr> arrayStart{};
++#ifdef __vita__
++  // A hash of each indexed array's bytes (and base index), taken once when the array is
++  // pushed: the Vita renderer keys its vertex cache with it instead of re-reading arrays.
++  std::array<u32, MaxIndexAttr> arrayHash{};
++#endif
+ };
+ static_assert(std::has_unique_object_representations_v<DrawImmediateData>);
++#ifdef __vita__
++static_assert(sizeof(DrawImmediateData) == 112);
++#else
+ static_assert(sizeof(DrawImmediateData) == 64);
++#endif
+ 
+ extern wgpu::BindGroup g_emptyTextureBindGroup;
+ 
+@@ -314,6 +323,9 @@ struct AttrArray {
+   bool le = true;
+   gfx::Range cachedRange;
+   u32 baseIndex = 0; // GX_AURORA_LOAD_ARRAY_BASE_INDEX
++#ifdef __vita__
++  u32 cachedHash = 0; // of the bytes behind cachedRange (DrawImmediateData::arrayHash)
++#endif
+ };
+ inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
+   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
+@@ -668,6 +680,16 @@ struct ShaderInfo {
+   bool usesShadow : 1 = false;    // ShaderConfig::shadow: the shadow uniforms and vs_shadow
+   bool shadowReceive : 1 = false; // shadow_receives: group 2 uses the shadow layout
+   bool usesHdrTone : 1 = false;   // ShaderConfig::sceneHdr without pbr: the hdr_tone uniform (GXState::pbrTone)
++#ifdef __vita__
++  // The Vita's compact matrix block (in place of the 30 matrices; the post matrices go in
++  // it too): the position and normal matrix of the draw (all 10 of each when vertices carry
++  // matrix indices), then one matrix per texcoord in vitaTexMask, then one post matrix per
++  // texcoord in vitaPostMask. Not for emboss or per-vertex texture matrices.
++  bool vitaCompact : 1 = false;
++  bool vitaPnFull : 1 = false;
++  u8 vitaTexMask = 0;
++  u8 vitaPostMask = 0;
++#endif
+ };
+ struct BindGroupRanges {
+   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
+diff --git a/extern/aurora/lib/gx/resident.cpp b/extern/aurora/lib/gx/resident.cpp
+index abd3421..5672a35 100644
+--- a/extern/aurora/lib/gx/resident.cpp
++++ b/extern/aurora/lib/gx/resident.cpp
+@@ -106,7 +106,11 @@ void Allocator::free(uint32_t offset, uint32_t size) noexcept {
+   }
+ }
+ 
++static uint32_t sGeneration = 1;
++uint32_t generation() noexcept { return sGeneration; }
++
+ void retain(const void* key, std::unique_ptr<std::vector<uint8_t>> bytes) {
++  ++sGeneration;
+   // The game counts its retains, so a second one only comes after a release.
+   release(key);
+   Entry entry;
+@@ -115,6 +119,7 @@ void retain(const void* key, std::unique_ptr<std::vector<uint8_t>> bytes) {
+ }
+ 
+ void release(const void* key) {
++  ++sGeneration;
+   const auto it = g_state.entries.find(key);
+   if (it == g_state.entries.end()) {
+     return;
+diff --git a/extern/aurora/lib/gx/resident.hpp b/extern/aurora/lib/gx/resident.hpp
+index af4765c..344f966 100644
+--- a/extern/aurora/lib/gx/resident.hpp
++++ b/extern/aurora/lib/gx/resident.hpp
+@@ -77,5 +77,7 @@ void free_dl(Entry& entry) noexcept;
+ 
+ void reset() noexcept;
+ uint64_t used_bytes() noexcept;
++// Bumped by every retain and release: what a resident range holds can only change with it.
++uint32_t generation() noexcept;
+ 
+ } // namespace aurora::gx::resident
+diff --git a/extern/aurora/lib/gx/shader_info.cpp b/extern/aurora/lib/gx/shader_info.cpp
+index f7f88d9..49510b5 100644
+--- a/extern/aurora/lib/gx/shader_info.cpp
++++ b/extern/aurora/lib/gx/shader_info.cpp
+@@ -1,5 +1,7 @@
+ #include "shader_info.hpp"
+ 
++#include <bit>
++
+ #include "../gfx/recording.hpp"
+ 
+ #include <cmath>
+@@ -235,7 +237,9 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+   }
+ 
+   // 10 position matrices, 10 texture matrices, 10 normal matrices.
++#ifndef __vita__
+   info.uniformSize += sizeof(Mat3x4<float>) * 30;
++#endif
+ 
+   for (int i = 0; i < config.tevStageCount; ++i) {
+     const auto& stage = config.tevStages[i];
+@@ -347,6 +351,42 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+       info.usesPTTexMtx.set(postMtxIdx);
+     }
+   }
++#ifdef __vita__
++  {
++    bool compact = config.pbr == 0 && config.lineMode == 0;
++    u8 texMask = 0, postMask = 0;
++    for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
++      if (!info.sampledTexCoords.test(i)) {
++        continue;
++      }
++      const auto& tcg = config.tcgs[i];
++      const bool isMtx = tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4;
++      if (tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7) {
++        compact = false;
++      }
++      if (isMtx && config.attrs[GX_VA_TEX0MTXIDX + i].attrType != GX_NONE) {
++        compact = false;
++      }
++      if (isMtx && tcg.mtx != GX_IDENTITY && tcg.mtx / 3 < 20) {
++        texMask |= 1u << i;
++      }
++      if (tcg.postMtx != GX_PTIDENTITY && (tcg.postMtx - GX_PTTEXMTX0) / 3 < MaxPTTexMtx) {
++        postMask |= 1u << i;
++      }
++    }
++    if (compact) {
++      info.vitaCompact = true;
++      info.vitaPnFull = config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
++      info.vitaTexMask = texMask;
++      info.vitaPostMask = postMask;
++      info.usesPTTexMtx.reset();
++      info.uniformSize += sizeof(Mat3x4<float>) *
++                          ((info.vitaPnFull ? 20 : 2) + std::popcount(unsigned(texMask)) + std::popcount(unsigned(postMask)));
++    } else {
++      info.uniformSize += sizeof(Mat3x4<float>) * 30;
++    }
++  }
++#endif
+   if (config.pbr) {
+     info.usesPbr = true;
+     info.usesLightmap = config.pbrLightmapAttr != GX_VA_NULL;
+@@ -421,6 +461,34 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+   }
+   buf.append(proj);
+ 
++#ifdef __vita__
++  if (info.vitaCompact) {
++    if (info.vitaPnFull) {
++      for (int i = 0; i < MaxPnMtx; i++) {
++        buf.append(g_gxState.pnMtx[i].pos);
++      }
++      for (int i = 0; i < MaxPnMtx; i++) {
++        buf.append(g_gxState.pnMtx[i].nrm);
++      }
++    } else {
++      const u32 c = g_gxState.currentPnMtx < MaxPnMtx ? g_gxState.currentPnMtx : 0;
++      buf.append(g_gxState.pnMtx[c].pos);
++      buf.append(g_gxState.pnMtx[c].nrm);
++    }
++    for (int i = 0; i < MaxTexCoord; i++) {
++      if ((info.vitaTexMask >> i) & 1) {
++        const u32 m = g_gxState.tcgs[i].mtx / 3;
++        buf.append(m < MaxPnMtx ? g_gxState.pnMtx[m].pos : g_gxState.texMtxs[m - MaxPnMtx]);
++      }
++    }
++    for (int i = 0; i < MaxTexCoord; i++) {
++      if ((info.vitaPostMask >> i) & 1) {
++        buf.append(g_gxState.ptTexMtxs[(g_gxState.tcgs[i].postMtx - GX_PTTEXMTX0) / 3]);
++      }
++    }
++  } else
++#endif
++  {
+   for (int i = 0; i < MaxPnMtx; i++) {
+     buf.append(g_gxState.pnMtx[i].pos);
+   }
+@@ -432,6 +500,7 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+   for (int i = 0; i < MaxPnMtx; i++) {
+     buf.append(g_gxState.pnMtx[i].nrm);
+   }
++  }
+ 
+   for (int i = 0; i < info.loadsTevReg.size(); ++i) {
+     if (info.loadsTevReg.test(i)) {
+diff --git a/extern/aurora/lib/gx/texture.cpp b/extern/aurora/lib/gx/texture.cpp
+index 3c73850..ecd1743 100644
+--- a/extern/aurora/lib/gx/texture.cpp
++++ b/extern/aurora/lib/gx/texture.cpp
+@@ -820,7 +820,12 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+                                           {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
+       ++s_stats.misses;
+       s_stats.uploadBytes += texture_handle_size(handle);
+-      cache_content_texture(std::move(keys->contentKey), handle);
++#ifdef __vita__
++      // Objects destroyed right after loading (movie frames) are new content every
++      // frame: caching them only fills the content cache with frames never seen again.
++      if (!obj.no_cache())
++#endif
++        cache_content_texture(std::move(keys->contentKey), handle);
+       if (!knownObject && obj.texObjId != 0 && !obj.no_cache()) {
+         note_new_object_upload(obj, handle);
+       }
+diff --git a/extern/aurora/lib/gx/texture.hpp b/extern/aurora/lib/gx/texture.hpp
+index fa46cb2..eaabe84 100644
+--- a/extern/aurora/lib/gx/texture.hpp
++++ b/extern/aurora/lib/gx/texture.hpp
+@@ -24,7 +24,13 @@ struct TextureStats {
+ const TextureStats& texture_stats() noexcept;
+ 
+ namespace texture {
++#ifdef __vita__
++// The Vita shares ~100 MB between textures and everything else: texture memory
++// beyond vitaGL's pools comes out of the game's own heap.
++constexpr uint64_t ContentCacheBudgetBytes = 24ull * 1024ull * 1024ull;
++#else
+ constexpr uint64_t ContentCacheBudgetBytes = 128ull * 1024ull * 1024ull;
++#endif
+ constexpr uint64_t ObjectCacheIdleFrames = 600;
+ constexpr bool AsyncTextureReplacements = true;
+ constexpr uint32_t ReplacementThumbnailDim = 64;
+diff --git a/extern/aurora/lib/thread.cpp b/extern/aurora/lib/thread.cpp
+index 348b0ec..1732736 100644
+--- a/extern/aurora/lib/thread.cpp
++++ b/extern/aurora/lib/thread.cpp
+@@ -281,7 +281,13 @@ void set_thread_name(const std::string& name) noexcept {
+ }
+ } // namespace
+ 
++#ifdef __vita__
++extern "C" void vita_place_named_thread(const char* name); // vita_prof.cpp
++#endif
+ void set_current(const Options& options) noexcept {
++#ifdef __vita__
++  vita_place_named_thread(options.name.c_str());
++#endif
+   if (!options.name.empty()) {
+     set_thread_name(options.name);
+ #ifdef TRACY_ENABLE
+diff --git a/extern/musyx/src/musyx/runtime/hw_pc.c b/extern/musyx/src/musyx/runtime/hw_pc.c
+index 34a4453..e70b276 100644
+--- a/extern/musyx/src/musyx/runtime/hw_pc.c
++++ b/extern/musyx/src/musyx/runtime/hw_pc.c
+@@ -1,6 +1,7 @@
+ #include "musyx/platform.h"
+ 
+ #include <SDL3/SDL_audio.h>
++#include "mp_vita_prof.h"
+ #include <SDL3/SDL_init.h>
+ #include <SDL3/SDL_mutex.h>
+ #include <SDL3/SDL_timer.h>
+@@ -966,6 +967,7 @@ void salCtrlDsp(s16* dest) {
+ static int salAudioThreadFunc(void* data) {
+   (void)data;
+   SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
++  MP_PROF_SET_AUDIO_THREAD();
+   while (SDL_GetAtomicInt(&salAudioThreadRunning)) {
+     const int queuedBytes = salAudioStream != NULL ? SDL_GetAudioStreamQueued(salAudioStream) : 0;
+     if (salAudioStream != NULL && queuedBytes >= SAL_BUFFER_BYTES * SAL_MAX_QUEUED_FRAMES) {
+@@ -977,7 +979,9 @@ static int salAudioThreadFunc(void* data) {
+     }
+ 
+     if (userCallback) {
++      MP_PROF_BEGIN(MP_PROF_MUSYX_FRAME);
+       userCallback();
++      MP_PROF_END(MP_PROF_MUSYX_FRAME);
+     }
+ 
+     /* Push rendered buffer to SDL audio stream */
+@@ -1119,9 +1123,17 @@ void hwExitIrq() {
+ 
+ void hwEnableIrq() { SDL_UnlockMutex(globalMutex); }
+ 
+-void hwDisableIrq() { SDL_LockMutex(globalMutex); }
++void hwDisableIrq() {
++  MP_PROF_BEGIN(MP_PROF_IRQ_LOCK);
++  SDL_LockMutex(globalMutex);
++  MP_PROF_END(MP_PROF_IRQ_LOCK);
++}
+ 
+-void hwIRQEnterCritical() { SDL_LockMutex(globalMutex); }
++void hwIRQEnterCritical() {
++  MP_PROF_BEGIN(MP_PROF_IRQ_LOCK);
++  SDL_LockMutex(globalMutex);
++  MP_PROF_END(MP_PROF_IRQ_LOCK);
++}
+ 
+ void hwIRQLeaveCritical() { SDL_UnlockMutex(globalMutex); }
+ 
+diff --git a/include/Kyoto/Graphics/CModel.hpp b/include/Kyoto/Graphics/CModel.hpp
+index 392d233..cff549e 100644
+--- a/include/Kyoto/Graphics/CModel.hpp
++++ b/include/Kyoto/Graphics/CModel.hpp
+@@ -104,6 +104,9 @@ private:
+   mutable CModel* x30_prev;
+   mutable CModel* x34_next;
+   mutable uint x38_lastFrame;
++#ifdef __vita__
++  const void* x3c_portRetained[5]; // arrays retained with Aurora (DolphinCModel.cpp)
++#endif
+ };
+ 
+ const CFactoryFnReturn FModelFactory(const SObjectTag& tag, const rstl::auto_ptr< uchar[] >& ptr,
+diff --git a/platform/ai_dma.cpp b/platform/ai_dma.cpp
+index 8949d8d..84b5bb6 100644
+--- a/platform/ai_dma.cpp
++++ b/platform/ai_dma.cpp
+@@ -1,3 +1,4 @@
++#include "mp_vita_prof.h"
+ // PC implementation of the GameCube audio-interface (AI) DMA path.
+ //
+ // MusyX has its own SDL stream in the vendored runtime, but streamed audio
+@@ -46,12 +47,14 @@ alignas(32) uint8_t sSilence[0x280] = {};
+ // its input (the THP movie player, e.g. the game-over screen) feeds its own
+ // output back into itself until it distorts.
+ void RunCallback() {
++  MP_PROF_BEGIN(MP_PROF_AUDIO_MIX);
+   // Re-zeroed every time: a callback that mixes in place would otherwise leave
+   // its output in the shared buffer for the next one to read as "silence".
+   std::memset(sSilence, 0, sizeof(sSilence));
+   sBuffer = reinterpret_cast< uintptr_t >(sSilence);
+   sLength = sizeof(sSilence);
+   sCallback();
++  MP_PROF_END(MP_PROF_AUDIO_MIX);
+ }
+ 
+ void EnsureStream() {
+diff --git a/platform/debug_ui.cpp b/platform/debug_ui.cpp
+index fac7a95..ce42693 100644
+--- a/platform/debug_ui.cpp
++++ b/platform/debug_ui.cpp
+@@ -71,6 +71,7 @@
+ #include "Kyoto/Audio/CSfxManager.hpp"
+ #include "MetroidPrime/SFX/UI.h"
+ 
++#include <bit>
+ #include <aurora/aurora.h>
+ #include <aurora/gfx.h>
+ #include <aurora/imgui.h>
+@@ -1275,6 +1276,11 @@ float SimPeriod() { return 1.f / static_cast< float >(SimRate()); }
+ 
+ bool SimAdaptive() {
+   EnsureInitialized();
++#ifdef __vita__
++  // One simulation step per frame, sized to the frame: fixed 60 Hz steps meant two per
++  // frame at 30 fps, and below 30 the catch-up steps took the time the frame needed.
++  return !sOriginalExperience;
++#endif
+   return sSimAdaptive && !sOriginalExperience;
+ }
+ 
+@@ -1330,6 +1336,11 @@ bool FrameLimitEnabled() {
+ 
+ int FrameRateCap() {
+   EnsureInitialized();
++#ifdef __vita__
++  // The Vita presents at most 30 frames a second: steadier pacing, and the CPU time
++  // a 60 fps target would spend waiting goes to the frame instead.
++  return 30;
++#endif
+   return EffectiveFrameLimit() ? 60 : sFpsCap;
+ }
+ 
+@@ -1605,6 +1616,10 @@ bool SharpScanWindow() {
+ 
+ const char* PromptGlyphs() {
+   const int glyphs = sPromptGlyphs.load(std::memory_order_relaxed);
++#ifdef __vita__
++  // On the Vita "auto" means its own buttons: cross, circle, square, triangle.
++  if (glyphs == 0) return "playstation";
++#endif
+   return glyphs > 0 ? kPromptGlyphs[glyphs] : nullptr;
+ }
+ 
+@@ -1980,6 +1995,10 @@ bool DirectAim() { return MouseAim() || TwinStick() || TouchDirectAim(); }
+ // touch overlay always does what its buttons say. The F1 menu (Visible) sees the stored values.
+ bool TwinStick() {
+   EnsureInitialized();
++#ifdef __vita__
++  // The Vita has two sticks: the right one aims and looks, as in other shooters.
++  return true;
++#endif
+ #if defined(__ANDROID__)
+   // Touch has its own twin stick (the right stick aims), apart from the pad preset.
+   if (TouchActive()) {
+@@ -1991,6 +2010,9 @@ bool TwinStick() {
+ 
+ bool PadTwinStick() {
+   EnsureInitialized();
++#ifdef __vita__
++  return true;
++#endif
+   return sInput.twinStick;
+ }
+ 
+@@ -2066,6 +2088,12 @@ void SetShiftBinding(int slot, int code) {
+ 
+ int PadAltButton(int bit) {
+   EnsureInitialized();
++#ifdef __vita__
++  // Vita: R fires (the A button's second input; cross stays A for the menus).
++  if (bit == std::countr_zero(static_cast< unsigned >(PAD_BUTTON_A)) && sInput.padAltButtons[bit] == -1) {
++    return SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
++  }
++#endif
+   return bit >= 0 && bit < kPadAltCount && !TouchActive() ? sInput.padAltButtons[bit] : -1;
+ }
+ 
+@@ -3370,7 +3398,12 @@ void SetStateManager(CStateManager* mgr) {
+   }
+   sStateManager = mgr;
+ }
+-bool QuickResume() { return sQuickResume; }
++bool QuickResume() {
++#ifdef __vita__
++  return false; // the Vita starts at the title screen (resume.mpss was skipping it)
++#endif
++  return sQuickResume;
++}
+ bool SaveStateRoomState() { return sSaveStateRoomState; }
+ CStateManager* StateManager() { return sStateManager; }
+ bool ViewRay(float origin[3], float forward[3]) {
+@@ -3844,6 +3877,13 @@ SDL_Window* MainWindow() {
+ }
+ 
+ bool WindowSize(int& width, int& height) {
++#ifdef __vita__
++  // The Vita's screen is the window (there is no SDL window here); its 960x544
++  // shape makes "Window" aspect fill the screen.
++  width = 960;
++  height = 544;
++  return true;
++#endif
+   SDL_Window* window = MainWindow();
+   return window != nullptr && SDL_GetWindowSize(window, &width, &height) && width > 0 &&
+          height > 0;
+diff --git a/platform/input/port_input_devices.cpp b/platform/input/port_input_devices.cpp
+index d612b5a..7e2e2ef 100644
+--- a/platform/input/port_input_devices.cpp
++++ b/platform/input/port_input_devices.cpp
+@@ -927,6 +927,15 @@ static void BindMenuDefaults(Profile& p) {
+   PADDefaultMapping def;
+   SDL_Gamepad* pad = RealPad();
+   PADGetDefaultMapping(&def, pad != nullptr ? PADGetControllerType(kPort) : PAD_TYPE_STANDARD);
++#ifdef __vita__
++  // The Vita has no analog triggers: its L/R shoulders page the menus (R fires in
++  // gameplay only), and Select is Z there as in gameplay.
++  for (PADButtonMapping& m : def.buttons) {
++    if (m.padButton == PAD_TRIGGER_L) m.nativeButton = SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
++    if (m.padButton == PAD_TRIGGER_R) m.nativeButton = SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
++    if (m.padButton == PAD_TRIGGER_Z) m.nativeButton = SDL_GAMEPAD_BUTTON_BACK;
++  }
++#endif
+   if (pad != nullptr) {
+     for (PADButtonMapping& m : def.buttons) {
+       if (m.nativeButton < SDL_GAMEPAD_BUTTON_COUNT &&
+diff --git a/platform/main.cpp b/platform/main.cpp
+index 088466e..3d16c35 100644
+--- a/platform/main.cpp
++++ b/platform/main.cpp
+@@ -940,6 +940,13 @@ int main(int argc, char** argv) {
+         residentMiB = static_cast<uint32_t>(
+             envMiB >= 0 ? std::clamp(static_cast<unsigned long>(envMiB), 16UL, 2048UL) : kResidentMiB);
+     }
++#ifdef __vita__
++    // The Vita keeps the loaded rooms' own geometry resident (CCubeRenderer::AddStaticGeometry).
++    if (residentMiB == 0) {
++        const int envMiB = port::EnvInt("MP_RESIDENT_MB", 48);
++        residentMiB = static_cast<uint32_t>(std::clamp(envMiB, 0, 128));
++    }
++#endif
+     uint32_t frameBufferScale = !roomGeometry ? 1 : resident ? kResidentFrameBuffers : kRoomGeoFrameBuffers;
+     const int envFrameBuffers = port::EnvInt("MP_FRAME_BUFFERS", -1);
+     if (envFrameBuffers >= 0) {
+diff --git a/src/Kyoto/Animation/DolphinCSkinRules.cpp b/src/Kyoto/Animation/DolphinCSkinRules.cpp
+index 2ce25d9..dda8a6c 100644
+--- a/src/Kyoto/Animation/DolphinCSkinRules.cpp
++++ b/src/Kyoto/Animation/DolphinCSkinRules.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Animation/CSkinRules.hpp"
++#include "mp_zone.h"
+ #include "Kyoto/Animation/CCharLayoutInfo.hpp"
+ #include "Kyoto/Animation/CPoseAsTransforms.hpp"
+ #include "Kyoto/Graphics/CModel.hpp"
+@@ -45,6 +46,7 @@ CSkinRules::~CSkinRules() {
+ 
+ void CSkinRules::BuildAccumulatedTransforms(const CPoseAsTransforms& pose,
+                                             const CCharLayoutInfo& layoutInfo) const {
++  MP_ZONE("SkinRules::BuildTransforms");
+   float pointStorage[100][3];
+   CVector3f* points = reinterpret_cast< CVector3f* >(pointStorage);
+   CSegId id = pose.GetTransforms().GetFirstElementPresent();
+@@ -61,6 +63,7 @@ void CSkinRules::BuildAccumulatedTransforms(const CPoseAsTransforms& pose,
+ }
+ 
+ void CSkinRules::BuildPoints(volatile void* pipe) const {
++  MP_ZONE("SkinRules::BuildPoints");
+   // On the console the write-gather pipe advances itself as vertices are
+   // written, so the same `pipe` value is passed to every bone. The PC
+   // implementation writes plain floats and cannot advance the caller's pointer,
+diff --git a/src/Kyoto/Animation/DolphinCSkinnedModel.cpp b/src/Kyoto/Animation/DolphinCSkinnedModel.cpp
+index 3654ef5..3d1219c 100644
+--- a/src/Kyoto/Animation/DolphinCSkinnedModel.cpp
++++ b/src/Kyoto/Animation/DolphinCSkinnedModel.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Animation/CSkinnedModel.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Alloc/CCircularBuffer.hpp"
+ #include "Kyoto/Alloc/CMemory.hpp"
+@@ -223,6 +224,7 @@ void CSkinnedModel::Construct() {
+ }
+ 
+ void CSkinnedModel::Draw(const CModelFlags& flags) const {
++  MP_ZONE("SkinnedModel::Draw");
+   CGraphics::sRenderState.SetSkinnedArraySizes(
+       x10_skinRules->GetNumPoints() * 12,
+       x10_skinRules->GetNumNormals() * NormalStride(**x4_model), NormalStride(**x4_model));
+diff --git a/src/Kyoto/Graphics/CCubeMaterial.cpp b/src/Kyoto/Graphics/CCubeMaterial.cpp
+index f90ca62..60ef100 100644
+--- a/src/Kyoto/Graphics/CCubeMaterial.cpp
++++ b/src/Kyoto/Graphics/CCubeMaterial.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Graphics/CCubeMaterial.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Basics/CBasics.hpp"
+ 
+@@ -673,6 +674,7 @@ bool CCubeMaterial::PortNeedsModelMatrix() const {
+ 
+ void CCubeMaterial::SetCurrent(const CModelFlags& flags, const CCubeSurface& surface,
+                                const CCubeModel& model) const {
++  MP_ZONE("CubeMaterial::SetCurrent");
+   if (x0_data == sLastMaterialCached) {
+     switch (sMaterialCachedState) {
+     case 1:
+diff --git a/src/Kyoto/Graphics/CCubeModel.cpp b/src/Kyoto/Graphics/CCubeModel.cpp
+index 3468096..f29b362 100644
+--- a/src/Kyoto/Graphics/CCubeModel.cpp
++++ b/src/Kyoto/Graphics/CCubeModel.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Graphics/CCubeModel.hpp"
++#include "mp_zone.h"
+ #include "Kyoto/Basics/CBasics.hpp"
+ #include <cstring>
+ #include <stdexcept>
+@@ -1118,6 +1119,7 @@ bool CCubeModel::TryLockTextures() const {
+ }
+ 
+ void CCubeModel::DrawSurfaces(const CModelFlags& flags) const {
++  MP_ZONE("CubeModel::DrawSurfaces");
+   if (sDrawingWireframe) {
+     for (CCubeSurface surface = GetNormalSurfaces(); surface.IsValid();
+          surface = surface.GetNextSurface()) {
+diff --git a/src/Kyoto/Graphics/CCubeMoviePlayer.cpp b/src/Kyoto/Graphics/CCubeMoviePlayer.cpp
+index f9b4286..c775e22 100644
+--- a/src/Kyoto/Graphics/CCubeMoviePlayer.cpp
++++ b/src/Kyoto/Graphics/CCubeMoviePlayer.cpp
+@@ -26,6 +26,18 @@
+ #include "dolphin/thp/THPAudio.h"
+ #include "dolphin/thp/THPPlayer.h"
+ #include "dolphin/thp/THPVideoDecode.h"
++#ifdef __vita__
++// vita_thp_async.cpp: movie frames are decoded on a worker thread.
++extern "C" void vita_thp_decode_async(const void* data, unsigned int size, void* y, void* u, void* v);
++extern "C" void vita_thp_wait(const void* y);
++extern "C" void vita_thp_wait_all();
++// Decodes take ~35 ms on the Vita, so frames are decoded further ahead than the
++// original two: kTexSets texture sets, up to kTexSets - 1 of them decoded ahead.
++static const int kTexSets = 5;
++#else
++static const int kTexSets = 3;
++#endif
++static const int kDecodeAhead = kTexSets - 1;
+ 
+ static int sNumReferences = 0;
+ static CMoviePlayer* sAudioPlayer;
+@@ -296,7 +308,7 @@ bool CMoviePlayer::PumpIndexLoad() {
+   }
+ 
+   xac_indexLoad = nullptr;
+-  x80_textures.reserve(3);
++  x80_textures.reserve(kTexSets);
+   xb4_nextReadOff = x28_header.mMovieDataOffsets;
+   xb0_nextReadSize = x28_header.mFirstFrameSize;
+   xb8_readSizeWrapped = x28_header.mFirstFrameSize;
+@@ -319,6 +331,9 @@ bool CMoviePlayer::PumpIndexLoad() {
+ }
+ 
+ CMoviePlayer::~CMoviePlayer() {
++#ifdef __vita__
++  vita_thp_wait_all(); // no decode may still be writing into our textures
++#endif
+   --sNumReferences;
+   VerifyCallbackStatus();
+   if (sAudioPlayer == this) {
+@@ -408,8 +423,13 @@ void CMoviePlayer::DecodeFromRead(const void* ptr) {
+   for (uint i = 0; i < x58_thpComponents.mNumComponents; ++i) {
+     const uchar* data = dataStart + offset;
+     if (x58_thpComponents.mFrameComp[i] == 0) {
++#ifdef __vita__
++      (void)alignedWork;
++      vita_thp_decode_async(data, CBasics::SwapBytes(*sizes), texture.Y(), texture.U(), texture.V());
++#else
+       THPVideoDecode(const_cast< uchar* >(data), texture.Y(), texture.U(), texture.V(),
+                      alignedWork);
++#endif
+     } else if (x58_thpComponents.mFrameComp[i] == 1) {
+       const uint samples =
+           THPAudioDecode(static_cast< short* >(texture.Audio()), const_cast< uchar* >(data), 0);
+@@ -440,7 +460,7 @@ void CMoviePlayer::Update(float dt) {
+         xc0_curLoadFrame >= x9c_requestQueue.size()) {
+       canDecode = true;
+     }
+-    if (x98_request->IsComplete() && xd8_decodedTexCount < 2 && canDecode) {
++    if (x98_request->IsComplete() && xd8_decodedTexCount < kDecodeAhead && canDecode) {
+       DecodeFromRead(x90_requestBuffer.get());
+       ReadCompleted();
+       PostDVDReadRequestIfNeeded();
+@@ -455,7 +475,7 @@ void CMoviePlayer::Update(float dt) {
+       x9c_requestQueue.size() < x28_header.mNumFrames) {
+     PostDVDReadRequestIfNeeded();
+   }
+-  if (xd8_decodedTexCount < 2 && xe0_playMode == kPM_Playing &&
++  if (xd8_decodedTexCount < kDecodeAhead && xe0_playMode == kPM_Playing &&
+       xc4_requestFrameWrapped < xf0_preLoadFrames) {
+     const int frame = rstl::min_val(xc4_requestFrameWrapped, x9c_requestQueue.size() - 1);
+     if (frame == -1) {
+@@ -513,6 +533,9 @@ void CMoviePlayer::DrawFrame(const CVector3f& v1, const CVector3f& v2, const CVe
+   sAudioPlayer = this;
+   OSRestoreInterrupts(interrupts);
+   CTHPTextureSet& texture = x80_textures[xd0_drawTexSlot];
++#ifdef __vita__
++  vita_thp_wait(texture.Y()); // normally finished long ago
++#endif
+   const bool field = CGraphics::GetDolphinLastFrameAbove();
+   const bool deinterlace = xf4_25_deinterlace;
+   MyTHPGXYuv2RgbSetup(field, deinterlace);
+@@ -548,6 +571,9 @@ bool CMoviePlayer::GetIsMovieFinishedPlaying() const {
+ }
+ 
+ void CMoviePlayer::Rewind() {
++#ifdef __vita__
++  vita_thp_wait_all(); // the textures below are about to be freed
++#endif
+   if (!x98_request.null()) {
+     x98_request->PostCancelRequest();
+     x98_request = nullptr;
+@@ -667,6 +693,15 @@ uint CMoviePlayer::GetHeight() const { return x6c_videoInfo.mYSize; }
+ 
+ #ifdef TARGET_PC
+ void CMoviePlayer::PortGetMargins(int vpWidth, int vpHeight, int& xMargin, int& yMargin) const {
++#ifdef __vita__
++  // Vita: movies are stretched to fill the screen (the player's choice) instead of
++  // being shown at their own 4:3 shape between black bars.
++  (void)vpWidth;
++  (void)vpHeight;
++  xMargin = 0;
++  yMargin = 0;
++  return;
++#endif
+   const int width = static_cast< int >(x6c_videoInfo.mXSize);
+   const int height = static_cast< int >(x6c_videoInfo.mYSize);
+   if ((width == 640 && height == 480) || width <= 0 || height <= 0 || vpWidth <= 0 || vpHeight <= 0) {
+diff --git a/src/Kyoto/Graphics/DolphinCModel.cpp b/src/Kyoto/Graphics/DolphinCModel.cpp
+index d56b3f5..0547e02 100644
+--- a/src/Kyoto/Graphics/DolphinCModel.cpp
++++ b/src/Kyoto/Graphics/DolphinCModel.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Alloc/CMemory.hpp"
++#include "mp_zone.h"
+ #include "Kyoto/Basics/CBasics.hpp"
+ #include "Kyoto/CFrameDelayedKiller.hpp"
+ #include "Kyoto/Graphics/CCubeModel.hpp"
+@@ -7,6 +8,9 @@
+ #include "Kyoto/Math/CAABox.hpp"
+ #include "Kyoto/Math/CVector2f.hpp"
+ #include "dolphin/gx/GXGeometry.h"
++#ifdef __vita__
++#include <dolphin/gx/GXExtra.h>
++#endif
+ #include "dolphin/os/OSCache.h"
+ #include "dolphin/types.h"
+ 
+@@ -113,6 +117,26 @@ CModel::CModel(const rstl::auto_ptr< uchar[] >& data, int length, IObjectStore&
+                         (visorFlags ? 1 : 0) | (nbtNormals ? CCubeModel::kNbtNormals : 0) |
+                             (nbtNormals && nbtNormals5 ? CCubeModel::kNbtNormals5 : 0), true, -1, positionsSize, normalsSize, colorsSize,
+                         floatUvsSize, shortUvsSize);
++#ifdef __vita__
++  // Vita: the model's display lists and static arrays are retained with Aurora for its
++  // lifetime (GXPortRetainResident), so each display list is parsed and converted once
++  // instead of every frame (its strips were most of the command processor's frame).
++  // Skinned draws still send their animated positions/normals; the lists and the UV and
++  // colour arrays stay resident.
++  {
++    const void* arrays[5] = {positions, normals, vtxColors, floatUvs, shortUvs};
++    const uint sizes[5] = {positionsSize, normalsSize, colorsSize, floatUvsSize, shortUvsSize};
++    for (int k = 0; k < 5; ++k)
++      if (arrays[k] != nullptr && sizes[k] != 0) GXPortRetainResident(arrays[k], sizes[k]);
++    for (int i = 0; i < x8_surfaces.size(); ++i) {
++      CCubeSurface surface(x8_surfaces[i]);
++      if (surface.GetDisplayList() != nullptr && surface.GetDisplayListSize() != 0)
++        GXPortRetainResident(surface.GetDisplayList(), surface.GetDisplayListSize());
++    }
++    x3c_portRetained[0] = positions, x3c_portRetained[1] = normals, x3c_portRetained[2] = vtxColors;
++    x3c_portRetained[3] = floatUvs, x3c_portRetained[4] = shortUvs;
++  }
++#endif
+   sThisFrameList = this;
+   if (x34_next != nullptr) {
+     x34_next->x30_prev = this;
+@@ -123,6 +147,15 @@ CModel::CModel(const rstl::auto_ptr< uchar[] >& data, int length, IObjectStore&
+ }
+ 
+ CModel::~CModel() {
++#ifdef __vita__
++  for (int k = 0; k < 5; ++k)
++    if (x3c_portRetained[k] != nullptr) GXPortReleaseResident(x3c_portRetained[k]);
++  for (int i = 0; i < x8_surfaces.size(); ++i) {
++    CCubeSurface surface(x8_surfaces[i]);
++    if (surface.GetDisplayList() != nullptr && surface.GetDisplayListSize() != 0)
++      GXPortReleaseResident(surface.GetDisplayList());
++  }
++#endif
+   RemoveFromList();
+   RemoveFromTotal(x4_dataLen);
+   const int frame = CGraphics::GetFrameCounter();
+@@ -146,6 +179,7 @@ CModel::~CModel() {
+ }
+ 
+ void CModel::Draw(const CModelFlags& flags) const {
++  MP_ZONE("Model::Draw");
+   if (flags.GetOtherFlags() & CModelFlags::kF_DrawNormal) {
+     x28_modelInstance->DrawNormal(nullptr, nullptr, kSS_All);
+   }
+diff --git a/src/Kyoto/Particles/CElementGen.cpp b/src/Kyoto/Particles/CElementGen.cpp
+index a69140c..cf3a984 100644
+--- a/src/Kyoto/Particles/CElementGen.cpp
++++ b/src/Kyoto/Particles/CElementGen.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Particles/CElementGen.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Basics/CStopwatch.hpp"
+ #include "Kyoto/CRandom16.hpp"
+@@ -555,6 +556,7 @@ void CElementGen::SetGlobalOrientAndTrans(const CTransform4f& xf) {
+ }
+ 
+ const bool CElementGen::Update(double dt) {
++  MP_ZONE("ElementGen::Update");
+ #ifdef TARGET_PC
+   PortFx::UpdateScope fxScope(dt);
+   if (fxScope.skip) {
+@@ -1261,6 +1263,7 @@ bool CElementGen::IsSystemDeletable() const {
+ }
+ 
+ void CElementGen::Render() {
++  MP_ZONE("ElementGen::Render");
+   CStopwatch timer;
+ #ifdef TARGET_PC
+   PortFx::RenderScope fxScope;
+diff --git a/src/Kyoto/Particles/CParticleSwoosh.cpp b/src/Kyoto/Particles/CParticleSwoosh.cpp
+index bf057e4..c63ec2b 100644
+--- a/src/Kyoto/Particles/CParticleSwoosh.cpp
++++ b/src/Kyoto/Particles/CParticleSwoosh.cpp
+@@ -1,4 +1,5 @@
+ #include "Kyoto/Particles/CParticleSwoosh.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Basics/CStopwatch.hpp"
+ #include "Kyoto/Graphics/CGX.hpp"
+@@ -360,6 +361,7 @@ bool CParticleSwoosh::IsSystemDeletable() const {
+ }
+ 
+ void CParticleSwoosh::Render() {
++  MP_ZONE("Swoosh::Render");
+ #ifdef TARGET_PC
+   PortFx::RenderScope fxScope;
+   if (PortFx::gMuteActive && PortFx::IsMuted(*this)) {
+diff --git a/src/MetaRender/CCubeRenderer.cpp b/src/MetaRender/CCubeRenderer.cpp
+index 9b200c3..e8c0038 100644
+--- a/src/MetaRender/CCubeRenderer.cpp
++++ b/src/MetaRender/CCubeRenderer.cpp
+@@ -1,4 +1,5 @@
+ #include "MetaRender/CCubeRenderer.hpp"
++#include "mp_zone.h"
+ #include "Kyoto/Basics/CBasics.hpp"
+ 
+ #include "Collision/CollisionUtil.hpp"
+@@ -447,6 +448,38 @@ CCubeRenderer::~CCubeRenderer() {
+   }
+ }
+ 
++#ifdef __vita__
++#include <dolphin/gx/GXExtra.h>
++#include "port_log.h"
++// Vita: a room's geometry (vertex arrays and every surface's display list) is
++// retained with Aurora while the room is loaded (GXPortRetainResident). Aurora then
++// converts each display list once and keeps it, with the arrays, in its resident
++// GPU region: a frame names them instead of copying and re-parsing them.
++static void PortKeepStaticGeometry(const rstl::vector< CMetroidModelInstance >* geometry, bool retain) {
++  for (int i = 0; i < geometry->size(); ++i) {
++    const CMetroidModelInstance& m = geometry->at(i);
++    const void* ptrs[5] = {m.GetVertexPointer(), m.GetNormalPointer(), m.GetColorPointer(), m.GetTCPointer(),
++                           m.GetPackedTCPointer()};
++    const uint sizes[5] = {m.GetVertexSize(), m.GetNormalSize(), m.GetColorSize(), m.GetTCSize(),
++                           m.GetPackedTCSize()};
++    for (int k = 0; k < 5; ++k) {
++      if (ptrs[k] == nullptr || sizes[k] == 0) continue;
++      if (retain) GXPortRetainResident(ptrs[k], sizes[k]);
++      else GXPortReleaseResident(ptrs[k]);
++    }
++    const rstl::vector< void* >& surfaces = m.GetSurfaces();
++    for (int s = 0; s < surfaces.size(); ++s) {
++      CCubeSurface surface(surfaces[s]);
++      const void* dl = surface.GetDisplayList();
++      const uint size = surface.GetDisplayListSize();
++      if (dl == nullptr || size == 0) continue;
++      if (retain) GXPortRetainResident(dl, size);
++      else GXPortReleaseResident(dl);
++    }
++  }
++}
++#endif
++
+ void CCubeRenderer::AddStaticGeometry(const rstl::vector< CMetroidModelInstance >* geometry,
+                                       const CAreaRenderOctTree* octTree, int areaIdx) {
+   if (FindStaticGeometry(geometry) == x1c_areaListItems.end()) {
+@@ -469,6 +502,40 @@ void CCubeRenderer::AddStaticGeometry(const rstl::vector< CMetroidModelInstance
+       }
+     }
+     x1c_areaListItems.push_back(CAreaListItem(geometry, octTree, textures, models, areaIdx));
++#ifdef __vita__
++    PortKeepStaticGeometry(geometry, true);
++    // Batching potential: opaque surfaces of one model that share a material could be
++    // one draw. Logged per area as it loads.
++    {
++      int surfaces = 0, opaque = 0, groups = 0, sortedN = 0, reflective = 0;
++      for (int mi = 0; mi < models->size(); ++mi) {
++        const CCubeModel& cm = *(*models)[mi];
++        const rstl::vector< void* >& surfs = geometry->at(mi).GetSurfaces();
++        uint seen[64];
++        int nseen = 0;
++        for (int si = 0; si < surfs.size(); ++si) {
++          const uint mat = static_cast< CCubeSurface::SSurfaceData* >(surfs[si])->mMaterialIndex;
++          ++surfaces;
++          const CCubeMaterial material = cm.GetMaterialByIndex(mat);
++          if (material.IsFlagSet(kStateFlag_DepthSorting)) {
++            ++sortedN;
++            continue;
++          }
++          if (material.IsFlagSet(kStateFlag_ReflectionSurfaceEye)) ++reflective;
++          ++opaque;
++          bool found = false;
++          for (int k = 0; k < nseen; ++k) found = found || seen[k] == mat;
++          if (!found) {
++            if (nseen < 64) seen[nseen++] = mat;
++            ++groups;
++          }
++        }
++      }
++      PortLog::Write("vita: area %d geometry: %d models, %d surfaces (%d sorted, %d opaque in %d material groups, "
++                     "%d per-surface reflections)\n",
++                     areaIdx, static_cast< int >(models->size()), surfaces, sortedN, opaque, groups, reflective);
++    }
++#endif
+     GXInvalidateVtxCache();
+   }
+ }
+@@ -486,6 +553,9 @@ CCubeRenderer::FindStaticGeometry(const rstl::vector< CMetroidModelInstance >* g
+ void CCubeRenderer::RemoveStaticGeometry(const rstl::vector< CMetroidModelInstance >* geometry) {
+   AUTO(search, FindStaticGeometry(geometry));
+   if (search != x1c_areaListItems.end()) {
++#ifdef __vita__
++    PortKeepStaticGeometry(geometry, false);
++#endif
+     x1c_areaListItems.erase(search);
+   }
+ }
+@@ -550,6 +620,7 @@ void CCubeRenderer::EndScene() {
+ }
+ 
+ void CCubeRenderer::AddParticleGen(const CParticleGen& gen) {
++  MP_ZONE("Renderer::AddParticleGen");
+   AUTO(bounds, gen.GetBounds());
+   if (bounds) {
+     CVector3f closestPoint = bounds->ClosestPointAlongVector(GetViewPlane().GetNormal());
+@@ -731,6 +802,7 @@ void CCubeRenderer::HandleUnsortedModelWireframe(const CAreaListItem* areaListIt
+ }
+ 
+ void CCubeRenderer::DrawUnsortedGeometry(int areaIdx, uint mask, uint targetMask) {
++  MP_ZONE("Renderer::DrawUnsorted");
+   const CAreaListItem* areaListItem = nullptr;
+ 
+   SetupRendererStates(true);
+@@ -788,6 +860,7 @@ void CCubeRenderer::DrawUnsortedGeometry(int areaIdx, uint mask, uint targetMask
+ }
+ 
+ void CCubeRenderer::DrawSortedGeometry(int areaIdx, uint mask, uint targetMask) {
++  MP_ZONE("Renderer::DrawSorted");
+   (void)mask;
+   (void)targetMask;
+ 
+@@ -2230,6 +2303,7 @@ void CCubeRenderer::DrawModelFlat(const CModel& model, const CModelFlags& flags,
+ }
+ 
+ void CCubeRenderer::DrawAreaGeometry(int areaIdx, uint mask, uint targetMask) {
++  MP_ZONE("Renderer::DrawAreaGeometry");
+   x318_30_inAreaDraw = true;
+   SetupRendererStates(true);
+ 
+diff --git a/src/MetroidPrime/CActor.cpp b/src/MetroidPrime/CActor.cpp
+index b07e7f0..89bdd92 100644
+--- a/src/MetroidPrime/CActor.cpp
++++ b/src/MetroidPrime/CActor.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CActor.hpp"
++#include "mp_zone.h"
+ 
+ #include "MetaRender/CCubeRenderer.hpp"
+ #include "MetroidPrime/CActorLights.hpp"
+@@ -230,6 +231,7 @@ void CActor::SetModelData(const CModelData& modelData) {
+ }
+ 
+ void CActor::PreRender(CStateManager& mgr, const CFrustumPlanes& planes) {
++  MP_ZONE("Actor::PreRender");
+   if (HasModelData()) {
+     SetPreRenderClipped(!planes.BoxInFrustumPlanes(x9c_renderBounds));
+     if (!GetPreRenderClipped()) {
+@@ -288,6 +290,7 @@ void CActor::PreRender(CStateManager& mgr, const CFrustumPlanes& planes) {
+ }
+ 
+ void CActor::AddToRenderer(const CFrustumPlanes& planes, const CStateManager& mgr) const {
++  MP_ZONE("Actor::AddToRenderer");
+   if (HasModelData()) {
+     if (GetRenderParticleDatabaseInside()) {
+       GetModelData()->RenderParticles(planes);
+@@ -340,6 +343,7 @@ bool CActor::CanRenderUnsorted(const CStateManager& mgr) const {
+ }
+ 
+ void CActor::Render(const CStateManager& mgr) const {
++  MP_ZONE("Actor::Render");
+   if (GetModelData() && !NullModel()) {
+     bool renderPrePostParticles = GetRenderParticleDatabaseInside() && HasAnimation();
+     if (renderPrePostParticles) {
+diff --git a/src/MetroidPrime/CActorModelParticles.cpp b/src/MetroidPrime/CActorModelParticles.cpp
+index d71e917..99ca0ed 100644
+--- a/src/MetroidPrime/CActorModelParticles.cpp
++++ b/src/MetroidPrime/CActorModelParticles.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CActorModelParticles.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Animation/CSkinnedModel.hpp"
+ #include "Kyoto/Audio/CSfxManager.hpp"
+@@ -627,6 +628,7 @@ CTexture* CActorModelParticles::GetAshyTexture(const CActor& actor) const {
+ }
+ 
+ void CActorModelParticles::Update(float dt, CStateManager& mgr) {
++  MP_ZONE("ActorModelParticles::Update");
+   UpdateSystemTypes();
+   AUTO(it, x0_items.begin());
+   while (it != x0_items.end()) {
+diff --git a/src/MetroidPrime/CAnimData.cpp b/src/MetroidPrime/CAnimData.cpp
+index b61b657..f67fe06 100644
+--- a/src/MetroidPrime/CAnimData.cpp
++++ b/src/MetroidPrime/CAnimData.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CAnimData.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Animation/CAnimTreeBlend.hpp"
+ #include "Kyoto/Animation/CAnimTreeNode.hpp"
+@@ -316,6 +317,7 @@ void CAnimData::SetXRayModel(const TLockedToken< CModel >& model,
+ }
+ 
+ void CAnimData::AdvanceAnim(CCharAnimTime& time, CVector3f& offset, CQuaternion& rotation) {
++  MP_ZONE("AnimData::AdvanceAnim");
+   const float dt = time.GetSeconds();
+   CAdvancementResults results(CCharAnimTime(0.f), CAdvancementDeltas());
+   rstl::optional_object< rstl::ownership_transfer< IAnimReader > > simplified;
+@@ -610,6 +612,7 @@ void CAnimData::SetupRender(const CSkinnedModel& model,
+ void CAnimData::Render(const CSkinnedModel& model, const CModelFlags& flags,
+                        const rstl::optional_object< CVertexMorphEffect >& morphEffect,
+                        const float* avgNormals) const {
++  MP_ZONE("AnimData::Render");
+   SetupRender(model, morphEffect, avgNormals);
+   DrawSkinnedModel(model, flags);
+ }
+diff --git a/src/MetroidPrime/CDecalManager.cpp b/src/MetroidPrime/CDecalManager.cpp
+index eb741e6..a6aeac4 100644
+--- a/src/MetroidPrime/CDecalManager.cpp
++++ b/src/MetroidPrime/CDecalManager.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CDecalManager.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Math/CAABox.hpp"
+ #include "MetaRender/CCubeRenderer.hpp"
+@@ -89,6 +90,7 @@ CDecalManager::RemoveFromActiveList(rstl::reserved_vector< int, 64 >::iterator i
+ }
+ 
+ void CDecalManager::Update(float dt, CStateManager& mgr) {
++  MP_ZONE("Decals::Update");
+   mDeltaTimeSinceLastDecalCreation += dt;
+   for (AUTO(it, mActiveIndexList.begin()); it != mActiveIndexList.end();) {
+     SDecal& decal = mDecalPool[*it];
+diff --git a/src/MetroidPrime/CEnvFxManager.cpp b/src/MetroidPrime/CEnvFxManager.cpp
+index dddd8e0..dc8c1b9 100644
+--- a/src/MetroidPrime/CEnvFxManager.cpp
++++ b/src/MetroidPrime/CEnvFxManager.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CEnvFxManager.hpp"
++#include "mp_zone.h"
+ 
+ #include "Kyoto/Audio/CSfxManager.hpp"
+ #include "Kyoto/CRandom16.hpp"
+@@ -289,6 +290,7 @@ void CEnvFxManager::Cleanup() {
+ }
+ 
+ void CEnvFxManager::Update(float dt, CStateManager& mgr) {
++  MP_ZONE("EnvFx::Update");
+   EEnvFxType fxType = mgr.GetWorld()->GetNeededEnvFx();
+   CTransform4f camXf(mgr.GetCameraManager()->GetCurrentCameraTransform(mgr));
+ 
+diff --git a/src/MetroidPrime/CFluidPlaneManager.cpp b/src/MetroidPrime/CFluidPlaneManager.cpp
+index 37d541c..ae326c8 100644
+--- a/src/MetroidPrime/CFluidPlaneManager.cpp
++++ b/src/MetroidPrime/CFluidPlaneManager.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CFluidPlaneManager.hpp"
++#include "mp_zone.h"
+ 
+ #include "MetroidPrime/CExplosion.hpp"
+ #include "MetroidPrime/CRipple.hpp"
+@@ -75,6 +76,7 @@ float CFluidPlaneManager::PortPresentLag() {
+ #endif
+ 
+ void CFluidPlaneManager::Update(float dt) {
++  MP_ZONE("FluidPlanes::Update");
+ #ifdef TARGET_PC
+   sPortLastDt = dt;
+   sPortUpdateGeneration = CActor::PortTickGeneration();
+diff --git a/src/MetroidPrime/CGameArea.cpp b/src/MetroidPrime/CGameArea.cpp
+index 32cdabe..77fc0ac 100644
+--- a/src/MetroidPrime/CGameArea.cpp
++++ b/src/MetroidPrime/CGameArea.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CGameArea.hpp"
++#include "mp_zone.h"
+ 
+ #include "MetroidPrime/CMemoryDrawEnum.hpp"
+ 
+@@ -1040,6 +1041,7 @@ void CGameArea::AliveUpdate(float dt) {
+ }
+ 
+ void CGameArea::PreRender() {
++  MP_ZONE("GameArea::PreRender");
+   if (xf0_24_postConstructed) {
+     if (x12c_postConstructed->x1108_28_occlusionPinged) {
+       x12c_postConstructed->x1108_28_occlusionPinged = false;
+diff --git a/src/MetroidPrime/CGameCollision.cpp b/src/MetroidPrime/CGameCollision.cpp
+index a6f112c..b54aff3 100644
+--- a/src/MetroidPrime/CGameCollision.cpp
++++ b/src/MetroidPrime/CGameCollision.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CGameCollision.hpp"
++#include "mp_zone.h"
+ #include "Collision/CCollidableAABoxSphere.hpp"
+ #include "Collision/CCollisionInfoList.hpp"
+ #include "Collision/CInternalRayCastStructure.hpp"
+@@ -767,6 +768,7 @@ CVector3f CGameCollision::GetActorRelativeVelocities(const CPhysicsActor* actor0
+ 
+ void CGameCollision::Move(CStateManager& mgr, CPhysicsActor& actor, float dt,
+                           const TEntityList* colliderList) {
++  MP_ZONE("Collision::Move");
+   if (!actor.GetMovable()) {
+     return;
+   }
+diff --git a/src/MetroidPrime/CGameCubeDoll.cpp b/src/MetroidPrime/CGameCubeDoll.cpp
+index 4ea4a71..7121735 100644
+--- a/src/MetroidPrime/CGameCubeDoll.cpp
++++ b/src/MetroidPrime/CGameCubeDoll.cpp
+@@ -13,6 +13,216 @@
+ 
+ #include "rstl/math.hpp"
+ 
++#ifdef __vita__
++// The Vita build shows an original handheld in place of the GameCube model: a
++// dark slab with rounded corners, a glowing screen, a stick and a D-pad on the
++// left, a stick and four round buttons on the right, and a blue light strip
++// around its edge. Built here and shaded on the CPU (one fixed light), drawn
++// with the engine's colour stream.
++#include <cmath>
++#include <vector>
++
++namespace {
++struct HVert {
++  float p[3];
++  float n[3];
++  float c[3];
++  bool emissive;
++};
++std::vector< HVert > sHandheld;
++
++void AddTri(const float* a, const float* b, const float* c, const float* n, const float* col, bool emissive) {
++  const float* pts[3] = {a, b, c};
++  for (int i = 0; i < 3; ++i) {
++    HVert v;
++    for (int k = 0; k < 3; ++k) {
++      v.p[k] = pts[i][k];
++      v.n[k] = n[k];
++      v.c[k] = col[k];
++    }
++    v.emissive = emissive;
++    sHandheld.push_back(v);
++  }
++}
++
++// A rounded rectangle in the XZ plane (x half-width hw, z half-height hh, corner
++// radius r), counter-clockwise seen from -Y.
++std::vector< float > RoundRect(float hw, float hh, float r, int segs) {
++  std::vector< float > out;
++  const float cx[4] = {hw - r, -(hw - r), -(hw - r), hw - r};
++  const float cz[4] = {hh - r, hh - r, -(hh - r), -(hh - r)};
++  for (int q = 0; q < 4; ++q) {
++    for (int i = 0; i <= segs; ++i) {
++      const float a = (q * 90.f + 90.f * i / segs) * 3.14159265f / 180.f;
++      out.push_back(cx[q] + r * std::cos(a));
++      out.push_back(cz[q] + r * std::sin(a));
++    }
++  }
++  return out;
++}
++
++// A flat face (fan from its centre) at depth y facing -Y (front) or +Y (back);
++// colour from the centre to the rim when they differ.
++void Face(const std::vector< float >& o, float ox, float oz, float y, bool front, const float* cIn, const float* cOut,
++          bool emissive) {
++  const int n = static_cast< int >(o.size() / 2);
++  const float nrm[3] = {0.f, front ? -1.f : 1.f, 0.f};
++  for (int i = 0; i < n; ++i) {
++    const int j = (i + 1) % n;
++    const float c[3] = {ox, y, oz};
++    const float a[3] = {ox + o[i * 2], y, oz + o[i * 2 + 1]};
++    const float b[3] = {ox + o[j * 2], y, oz + o[j * 2 + 1]};
++    // Centre and rim colours: split each fan triangle's colour by vertex.
++    HVert vc, va, vb;
++    const float* pts[3] = {c, a, b};
++    HVert* vs[3] = {&vc, &va, &vb};
++    for (int k = 0; k < 3; ++k) {
++      for (int m = 0; m < 3; ++m) {
++        vs[k]->p[m] = pts[k][m];
++        vs[k]->n[m] = nrm[m];
++        vs[k]->c[m] = k == 0 ? cIn[m] : cOut[m];
++      }
++      vs[k]->emissive = emissive;
++    }
++    sHandheld.push_back(vc);
++    sHandheld.push_back(front ? va : vb);
++    sHandheld.push_back(front ? vb : va);
++  }
++}
++
++// The side wall of an outline between depths y0 and y1.
++void Wall(const std::vector< float >& o, float ox, float oz, float y0, float y1, const float* col, bool emissive) {
++  const int n = static_cast< int >(o.size() / 2);
++  for (int i = 0; i < n; ++i) {
++    const int j = (i + 1) % n;
++    const float ax = ox + o[i * 2], az = oz + o[i * 2 + 1];
++    const float bx = ox + o[j * 2], bz = oz + o[j * 2 + 1];
++    float nx = bz - az, nz = -(bx - ax);
++    const float l = std::sqrt(nx * nx + nz * nz);
++    if (l < 1e-6f) continue;
++    const float nrm[3] = {nx / l, 0.f, nz / l};
++    const float p0[3] = {ax, y0, az}, p1[3] = {bx, y0, bz}, p2[3] = {bx, y1, bz}, p3[3] = {ax, y1, az};
++    AddTri(p0, p1, p2, nrm, col, emissive);
++    AddTri(p0, p2, p3, nrm, col, emissive);
++  }
++}
++
++// A raised part: its top face at y0 - h and its wall down to y0.
++void Raised(const std::vector< float >& o, float ox, float oz, float y0, float h, const float* top, const float* rim,
++            const float* side) {
++  Face(o, ox, oz, y0 - h, true, top, rim, false);
++  Wall(o, ox, oz, y0 - h, y0, side, false);
++}
++
++void BuildHandheld() {
++  if (!sHandheld.empty()) return;
++  const float shell[3] = {0.16f, 0.17f, 0.20f};
++  const float shellBack[3] = {0.12f, 0.13f, 0.15f};
++  const float glow[3] = {0.25f, 0.65f, 1.00f};
++  const float scrIn[3] = {0.16f, 0.36f, 0.62f};
++  const float scrOut[3] = {0.03f, 0.07f, 0.16f};
++  const float bezel[3] = {0.05f, 0.05f, 0.06f};
++  const float stickTop[3] = {0.30f, 0.31f, 0.34f};
++  const float stickRim[3] = {0.18f, 0.19f, 0.21f};
++  const float dark[3] = {0.09f, 0.09f, 0.10f};
++  const float pad[3] = {0.26f, 0.27f, 0.30f};
++  const float btnTop[3] = {0.78f, 0.80f, 0.84f};
++  const float btnRim[3] = {0.55f, 0.58f, 0.64f};
++
++  const float hw = 0.56f, hh = 0.25f, half = 0.05f;
++  const std::vector< float > body = RoundRect(hw, hh, 0.11f, 6);
++  Face(body, 0.f, 0.f, -half, true, shell, shell, false);
++  Face(body, 0.f, 0.f, half, false, shellBack, shellBack, false);
++  Wall(body, 0.f, 0.f, -half, -0.012f, shell, false);
++  Wall(body, 0.f, 0.f, -0.012f, 0.012f, glow, true); // the light strip
++  Wall(body, 0.f, 0.f, 0.012f, half, shellBack, false);
++
++  // Screen: a dark bezel and the glowing panel.
++  Face(RoundRect(0.315f, 0.195f, 0.035f, 4), 0.f, 0.015f, -half - 0.004f, true, bezel, bezel, false);
++  Face(RoundRect(0.29f, 0.17f, 0.02f, 4), 0.f, 0.015f, -half - 0.008f, true, scrIn, scrOut, true);
++
++  // Sticks (lower left and lower right): a low cylinder with a dished cap.
++  const std::vector< float > stick = RoundRect(0.055f, 0.055f, 0.0549f, 6);
++  const std::vector< float > cap = RoundRect(0.035f, 0.035f, 0.0349f, 6);
++  for (int side = -1; side <= 1; side += 2) {
++    const float x = side * 0.435f, z = -0.105f;
++    Face(RoundRect(0.068f, 0.068f, 0.0679f, 6), x, z, -half - 0.004f, true, dark, dark, false);
++    Raised(stick, x, z, -half, 0.03f, stickRim, stickRim, dark);
++    Face(cap, x, z, -half - 0.034f, true, stickTop, stickRim, false);
++  }
++
++  // D-pad (upper left): two crossed bars.
++  {
++    const float x = -0.435f, z = 0.085f;
++    Raised(RoundRect(0.06f, 0.019f, 0.006f, 2), x, z, -half, 0.012f, pad, pad, dark);
++    Raised(RoundRect(0.019f, 0.06f, 0.006f, 2), x, z, -half, 0.0121f, pad, pad, dark);
++  }
++
++  // Four round buttons (upper right) in a diamond.
++  {
++    const float x = 0.435f, z = 0.085f, d = 0.046f;
++    const float ox[4] = {0.f, d, 0.f, -d}, oz[4] = {d, 0.f, -d, 0.f};
++    const std::vector< float > btn = RoundRect(0.021f, 0.021f, 0.0209f, 5);
++    for (int i = 0; i < 4; ++i) Raised(btn, x + ox[i], z + oz[i], -half, 0.012f, btnTop, btnRim, btnRim);
++  }
++
++  // Shoulder buttons on the top edge, left and right: a rounded block standing
++  // out of the edge.
++  for (int side = -1; side <= 1; side += 2) {
++    const std::vector< float > sh = RoundRect(0.11f, 0.03f, 0.012f, 3);
++    const float x = side * 0.39f, z = hh - 0.005f;
++    // Built as a slab in the XZ plane, then its faces moved to sit along the edge.
++    Face(sh, x, z, -0.032f, true, pad, pad, false);
++    Face(sh, x, z, 0.032f, false, dark, dark, false);
++    Wall(sh, x, z, -0.032f, 0.032f, dark, false);
++  }
++
++  // Two small pill buttons under the screen.
++  for (int side = -1; side <= 1; side += 2)
++    Raised(RoundRect(0.03f, 0.009f, 0.0089f, 3), side * 0.06f, -0.215f, -half, 0.006f, pad, pad, dark);
++}
++
++void DrawHandheld(float alpha) {
++  BuildHandheld();
++  const float f = (CGraphics::GetSecondsMod900() * 360.f) * 0.25f;
++  const CTransform4f rot =
++      CTransform4f::RotateZ(CRelAngle::FromDegrees(-f)) * CTransform4f::RotateX(CRelAngle::FromDegrees(-12.f));
++  CGraphics::SetModelMatrix(rot * CTransform4f::Scale(0.75f));
++  CGraphics::DisableAllLights();
++  CGraphics::SetTevOp(kTS_Stage0, CGraphics::kEnvPassthru);
++  CGraphics::SetTevOp(kTS_Stage1, CGraphics::kEnvPassthru);
++  CGraphics::SetBlendMode(kBM_Blend, kBF_SrcAlpha, kBF_InvSrcAlpha, kLO_Clear);
++  CGraphics::SetDepthWriteMode(true, kE_LEqual, true);
++  CGraphics::SetCullMode(kCM_None);
++
++  // Light from the upper left, on the viewer's side (the camera looks along +Y).
++  float lx = -0.45f, ly = -1.f, lz = 0.6f;
++  const float ll = std::sqrt(lx * lx + ly * ly + lz * lz);
++  lx /= ll, ly /= ll, lz /= ll;
++  const uchar a = static_cast< uchar >(rstl::max_val(0.f, rstl::min_val(1.f, alpha)) * 255.f);
++
++  CGraphics::StreamBegin(kP_Triangles);
++  for (const HVert& v : sHandheld) {
++    float r = v.c[0], g = v.c[1], b = v.c[2];
++    if (!v.emissive) {
++      const CVector3f n = rot * CVector3f(v.n[0], v.n[1], v.n[2]);
++      const float d = rstl::max_val(0.f, n.GetX() * lx + n.GetY() * ly + n.GetZ() * lz);
++      // Ambient, diffuse, and a soft sheen where the surface faces the light.
++      const float k = 0.38f + 0.75f * d;
++      const float sheen = d > 0.9f ? (d - 0.9f) * 2.5f : 0.f;
++      r = r * k + sheen, g = g * k + sheen, b = b * k + sheen;
++    }
++    const uint col = (static_cast< uint >(rstl::min_val(1.f, r) * 255.f) << 24) |
++                     (static_cast< uint >(rstl::min_val(1.f, g) * 255.f) << 16) |
++                     (static_cast< uint >(rstl::min_val(1.f, b) * 255.f) << 8) | a;
++    CGraphics::StreamColor(col);
++    CGraphics::StreamVertex(v.p[0], v.p[1], v.p[2]);
++  }
++  CGraphics::StreamEnd();
++}
++} // namespace
++#endif
++
+ CGameCubeDoll::CGameCubeDoll()
+ : x0_model(gpSimplePool->GetObj("CMDL_GameCube"))
+ , x8_lights(1, CLight::BuildDirectional(CVector3f::Forward(), CColor(0xFFFFFFFF)),
+@@ -56,6 +266,10 @@ void CGameCubeDoll::Touch() {
+ }
+ 
+ void CGameCubeDoll::Update(float dt) {
++#ifdef __vita__
++  x1c_fader = rstl::min_val(1.f, (dt * 2.f) + x1c_fader);
++  return;
++#endif
+   if (!CheckLoadComplete())
+     return;
+   x1c_fader = rstl::min_val(1.f, (dt * 2.f) + x1c_fader);
+@@ -63,8 +277,10 @@ void CGameCubeDoll::Update(float dt) {
+ }
+ 
+ void CGameCubeDoll::Draw(float alpha) {
++#ifndef __vita__
+   if (!IsLoaded())
+     return;
++#endif
+ 
+   float alphaFader = alpha * x1c_fader;
+ 
+@@ -75,6 +291,10 @@ void CGameCubeDoll::Draw(float alpha) {
+                            0.2f, 4096.f);
+ 
+   CGraphics::SetViewPointMatrix(CTransform4f::Translate(0.f, -2.f, 0.f));
++#ifdef __vita__
++  DrawHandheld(alphaFader);
++  return;
++#endif
+   x18_actorLights->ActivateLights();
+ 
+   float f = (CGraphics::GetSecondsMod900() * 360.f) * 0.25f;
+diff --git a/src/MetroidPrime/CStateManager.cpp b/src/MetroidPrime/CStateManager.cpp
+index c7091e3..e9cb38d 100644
+--- a/src/MetroidPrime/CStateManager.cpp
++++ b/src/MetroidPrime/CStateManager.cpp
+@@ -1,5 +1,6 @@
+ #define CSTATEMANAGER_OUT_OF_LINE_GETPLAYER
+ #include "MetroidPrime/CStateManager.hpp"
++#include "mp_zone.h"
+ #include "port_apclient.h"
+ #include "port_collision_view.h"
+ #include "port_debug.h"
+@@ -929,6 +930,7 @@ rstl::optional_object< CAABox > CStateManager::CalculateObjectBounds(const CActo
+ }
+ 
+ void CStateManager::UpdateSortedLists() {
++  MP_ZONE("SM::UpdateSortedLists");
+   if (x850_world.get() == nullptr) {
+     return;
+   }
+@@ -1293,6 +1295,7 @@ void CStateManager::UpdateGameState() {}
+ extern "C" void nullsub_34(CStateManager*) {}
+ 
+ void CStateManager::MovePlatforms(float dt) {
++  MP_ZONE("SM::MovePlatforms");
+   CObjectList* platformAndDoorList = x808_objectLists[kOL_PlatformAndDoor].get();
+   for (int i = platformAndDoorList->GetFirstObjectIndex(); i != -1;
+        i = platformAndDoorList->GetNextObjectIndex(i)) {
+@@ -1341,6 +1344,7 @@ void CStateManager::MoveDoors(float dt) {
+ }
+ 
+ void CStateManager::CrossTouchActors() {
++  MP_ZONE("SM::CrossTouchActors");
+   CObjectList* actorList = x808_objectLists[kOL_Actor].get();
+   bool visits[kMaxEntities];
+   memset(visits, 0, sizeof(visits));
+@@ -1380,6 +1384,7 @@ void CStateManager::CrossTouchActors() {
+ }
+ 
+ void CStateManager::Think(float dt) {
++  MP_ZONE("SM::Think");
+   const float deathTime = x84c_player->GetDeathTime();
+   if (deathTime > 0.f) {
+     x84c_player->DoThink(dt, *this);
+@@ -1430,6 +1435,7 @@ void CStateManager::Think(float dt) {
+ }
+ 
+ void CStateManager::PreThinkObjects(float dt) {
++  MP_ZONE("SM::PreThinkObjects");
+   const float deathTime = x84c_player->GetDeathTime();
+   if (deathTime > 0.f) {
+     x84c_player->DoPreThink(dt, *this);
+@@ -1458,6 +1464,7 @@ void CStateManager::PreThinkObjects(float dt) {
+ void CStateManager::PostUpdatePlayer(float dt) { x84c_player->DoPostCameraStuff(dt, *this); }
+ 
+ void CStateManager::Update(float dt) {
++  MP_ZONE("SM::Update");
+   if (GetWantsToQuit()) return;
+ 
+ #ifdef TARGET_PC
+@@ -1808,6 +1815,7 @@ void CStateManager::FrameEnd() {
+ }
+ 
+ void CStateManager::UpdateAreaSounds() {
++  MP_ZONE("SM::UpdateAreaSounds");
+   rstl::reserved_vector< int, 10 > areaIds;
+   areaIds.clear();
+   for (CGameArea::CConstChainIterator areaIt = x850_world->GetChainHead(CWorld::kC_Alive);
+@@ -2613,6 +2621,7 @@ bool CStateManager::GetVisSetForArea(const TAreaId areaA, const TAreaId areaB, C
+ CGameArea::CChainIterator CWorld::AliveAreasEnd() { return skGlobalNonConstEnd; }
+ 
+ void CStateManager::PreRender() {
++  MP_ZONE("SM::PreRender");
+   if (!xf94_24_readyToRender) {
+     return;
+   }
+@@ -3239,6 +3248,7 @@ float CStateManager::PortZoomedFov(float fov) {
+ #endif
+ 
+ void CStateManager::DrawWorld() const {
++  MP_ZONE("SM::DrawWorld");
+ #ifdef TARGET_PC
+   // A zoomed pass (sharp scan window) draws before the frame's own: the frame's captures and
+   // the gun belong to that one.
+@@ -3751,6 +3761,7 @@ void CStateManager::RenderCamerasAndAreaLights() const {
+ void CStateManager::DrawDebugStuff() const {}
+ 
+ void CStateManager::BuildDynamicLightListForWorld() {
++  MP_ZONE("SM::BuildDynLights");
+   if (x8b8_playerState->GetActiveVisor(*this) == CPlayerState::kPV_Thermal) {
+     x8e0_dynamicLights = rstl::vector< CLight >();
+     return;
+diff --git a/src/MetroidPrime/CWorld.cpp b/src/MetroidPrime/CWorld.cpp
+index 3e477d6..1d3125d 100644
+--- a/src/MetroidPrime/CWorld.cpp
++++ b/src/MetroidPrime/CWorld.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/CWorld.hpp"
++#include "mp_zone.h"
+ 
+ #include "MetroidPrime/CScriptLayerManager.hpp"
+ 
+@@ -631,6 +632,7 @@ void CWorld::TouchSky() const {
+ }
+ 
+ void CWorld::Update(float dt) {
++  MP_ZONE("World::Update");
+   xc4_neededFx = kEFX_None;
+   bool needsSky = false;
+   bool skyVisible = false;
+diff --git a/src/MetroidPrime/Cameras/CCameraManager.cpp b/src/MetroidPrime/Cameras/CCameraManager.cpp
+index 258fb80..729bfe2 100644
+--- a/src/MetroidPrime/Cameras/CCameraManager.cpp
++++ b/src/MetroidPrime/Cameras/CCameraManager.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/Cameras/CCameraManager.hpp"
++#include "mp_zone.h"
+ 
+ #include "port_debug.h"
+ #include "port_presentation_rules.h"
+@@ -353,6 +354,7 @@ void CCameraManager::SetWaterFogScale(float fogDensityTarget, float fogDensitySp
+ }
+ 
+ void CCameraManager::Update(float dt, CStateManager& mgr) {
++  MP_ZONE("CameraManager::Update");
+   const TUniqueId previousId = GetCurrentCameraId();
+   const CTransform4f previousTransform =
+       GetCurrentCamera(mgr).GetTransform() * CTransform4f::Translate(x30_shakeOffset);
+diff --git a/src/MetroidPrime/Enemies/CPatterned.cpp b/src/MetroidPrime/Enemies/CPatterned.cpp
+index ea27665..20600f2 100644
+--- a/src/MetroidPrime/Enemies/CPatterned.cpp
++++ b/src/MetroidPrime/Enemies/CPatterned.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/Enemies/CPatterned.hpp"
++#include "mp_zone.h"
+ 
+ #include <math.h>
+ 
+@@ -762,6 +763,7 @@ bool rstl::operator==(const char* lhs, const rstl::string& rhs) {
+ }
+ 
+ void CPatterned::Think(float dt, CStateManager& mgr) {
++  MP_ZONE("Patterned::Think");
+   if (!GetActive()) {
+     return;
+   }
+diff --git a/src/MetroidPrime/Player/CPlayer.cpp b/src/MetroidPrime/Player/CPlayer.cpp
+index 7c1f895..79e7b62 100644
+--- a/src/MetroidPrime/Player/CPlayer.cpp
++++ b/src/MetroidPrime/Player/CPlayer.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/Player/CPlayer.hpp"
++#include "mp_zone.h"
+ 
+ #include "port_console.h"
+ #include "port_debug.h"
+@@ -2524,6 +2525,7 @@ void CPlayer::RenderReflectedPlayer(CStateManager& mgr) {
+ }
+ 
+ void CPlayer::Render(const CStateManager& mgr) const {
++  MP_ZONE("Player::Render");
+   bool doRender = x2f4_cameraState != kCS_Spawned;
+   if (!doRender) {
+     if (const CCinematicCamera* cam =
+diff --git a/src/MetroidPrime/Player/CPlayerGun.cpp b/src/MetroidPrime/Player/CPlayerGun.cpp
+index cd67acc..34e0c0f 100644
+--- a/src/MetroidPrime/Player/CPlayerGun.cpp
++++ b/src/MetroidPrime/Player/CPlayerGun.cpp
+@@ -1,4 +1,5 @@
+ #include "MetroidPrime/Player/CPlayerGun.hpp"
++#include "mp_zone.h"
+ #include "port_debug.h"
+ #include "port_room_env.h"
+ #include "port_synthetic_effect.h"
+@@ -656,6 +657,7 @@ CTransform4f CPlayerGun::PortGunView(const CStateManager& mgr,
+ 
+ void CPlayerGun::Render(const CStateManager& mgr, const CVector3f& pos,
+                         const CModelFlags& flags) const {
++  MP_ZONE("PlayerGun::Render");
+ #ifdef TARGET_PC
+   const CVector3f probePos = mgr.GetPlayer()->GetTranslation();
+   const float probeXyz[3] = {probePos.GetX(), probePos.GetY(), probePos.GetZ()};
+diff --git a/src/MetroidPrime/main.cpp b/src/MetroidPrime/main.cpp
+index 691ee12..f81aa99 100644
+--- a/src/MetroidPrime/main.cpp
++++ b/src/MetroidPrime/main.cpp
+@@ -217,6 +217,9 @@ static void ApplyAspectMode() {
+   if (fbWidth == renderMode.fbWidth) {
+     return;
+   }
++#ifdef __vita__
++  fprintf(stderr, "port: aspect: framebuffer width %d -> %d (efb height %d)\n", renderMode.fbWidth, fbWidth, efbHeight);
++#endif
+   CGraphics::PortResizeFrameBuffer(static_cast< u16 >(fbWidth));
+   CCameraManager::RefreshAspectRatio();
+ }
+@@ -540,6 +543,14 @@ bool CGameArchitectureSupport::UpdateTicks() {
+   if (PortDebug::TickHold()) {
+     ticks = PortDebug::TakeHeldTicks();
+   }
++#ifdef __vita__
++  // At most two steps a frame: catch-up steps cost the time the frame needed (six a frame
++  // in the heaviest rooms). Full speed down to 15 fps (adaptive steps are up to 1/30 s);
++  // below that the game slows instead of spiralling.
++  if (ticks > 2 && !PortDebug::Turbo() && !PortDebug::TickHold()) {
++    ticks = 2;
++  }
++#endif
+ 
+   const float tickPeriod = static_cast< float >(period);
+   PortDebug::SetTickPeriod(tickPeriod);

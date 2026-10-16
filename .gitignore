@@ -1,0 +1,10 @@
+mpp/
+vita/libsrc/
+vita/buildscripts/
+vita/src/
+vita/sdk/
+vita/deps/
+vita/b/
+*.iso
+*.nkit.iso
+*.vpk
